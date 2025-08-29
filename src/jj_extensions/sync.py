@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from .shell import run, run_ok
 
@@ -57,82 +57,39 @@ def _sanitize_branch_name(raw: str) -> Optional[str]:
     # Drop trailing colon that jj sometimes shows after names
     if name.endswith(":"):
         name = name[:-1]
+    # If there are multiple branches on one commit, just get the first one
+    if len(name.split(" ")) >= 2:
+        name = name.split(" ")[0]
     return name or None
 
 
-def list_branches(repo_path: str) -> List[BranchInfo]:
+def get_branches_from_main_to_current_commit_excluding_main(
+    repo_path: str,
+) -> List[str]:
     # Prefer templated output for broad jj compatibility
     try:
         out = run_ok(
-            ["jj", "bookmark", "list", "-T", 'name++"\\n"'],
+            # jj log -r 'trunk()..@' -T 'bookmarks++"\n"' --no-graph
+            ["jj", "log", "-r", "trunk()..@", "-T", 'bookmarks++"\\n"', "--no-graph"],
             cwd=repo_path,
         )
-        branches: List[BranchInfo] = []
+        # branches: List[BranchInfo] = []
+        branches: List[str] = []
         for line in out.splitlines():
             name = _sanitize_branch_name(line)
             if name:
-                branches.append(BranchInfo(name=name, target=""))
+                # branches.append(BranchInfo(name=name, target=""))
+                branches.append(name)
         if branches:
+            branches.reverse()
             return branches
     except Exception:
         pass
-    # Last resort: plain text parsing
-    text = run_ok(["jj", "bookmark", "list"], cwd=repo_path)
-    branches: List[BranchInfo] = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        parts = line.strip().split()
-        name_raw = parts[0]
-        name = _sanitize_branch_name(name_raw)
-        if name:
-            branches.append(BranchInfo(name=name, target=""))
-    return branches
 
 
 def _quote_revset_string(s: str) -> str:
     escaped = s.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
-
-
-def sort_branches_as_stack(repo_path: str, branches: List[BranchInfo]) -> List[str]:
-    # Dedupe while preserving original order
-    seen = set()
-    names: List[str] = []
-    for b in branches:
-        if b.name not in seen:
-            names.append(b.name)
-            seen.add(b.name)
-    if not names:
-        return []
-    # Template: bookmarks joined by comma, then space, then commit_id, newline
-    template = 'bookmarks.join(",") ++ " " ++ commit_id ++ "\\n"'
-    # Use bookmarks() to select the commits pointed at by these bookmarks
-    rev_terms = [f"bookmarks({_quote_revset_string(name)})" for name in names]
-    revset = " | ".join(rev_terms)
-    out = run_ok(
-        ["jj", "log", "-r", revset, "--no-graph", "-T", template], cwd=repo_path
-    )
-    lines = [l for l in out.splitlines() if l.strip()]
-    commit_to_branches: List[Tuple[str, List[str]]] = []
-    for line in lines:
-        try:
-            left, commit = line.rsplit(" ", 1)
-            bnames = [n for n in left.split(",") if n]
-            commit_to_branches.append((commit, bnames))
-        except ValueError:
-            continue
-    ordered: List[str] = []
-    emitted = set()
-    for _, bnames in commit_to_branches:
-        for b in bnames:
-            if b in names and b not in emitted:
-                ordered.append(b)
-                emitted.add(b)
-    for b in names:
-        if b not in emitted:
-            ordered.append(b)
-    return ordered
 
 
 def gh_list_open_prs_by_head(repo_path: str) -> Dict[str, PullRequest]:
@@ -227,24 +184,24 @@ def sync_stack(
     dry_run: bool = False,
 ) -> None:
     run(
-        ["jj", "git", "push", "--allow-new", "--remote", remote],
+        # jj git push -r 'trunk()..@' --allow-new
+        ["jj", "git", "push", "-r", "trunk()..@", "--allow-new"],
         cwd=repo_path,
         check=True,
     )
 
-    branches = list_branches(repo_path)
+    branches = get_branches_from_main_to_current_commit_excluding_main(repo_path)
     if not branches:
         return
-    ordered_branch_names = sort_branches_as_stack(repo_path, branches)
-    print(ordered_branch_names)
+    print(branches)
     base_default = default_base or get_default_branch(repo_path)
     print(base_default)
     head_to_pr = gh_list_open_prs_by_head(repo_path)
     print(head_to_pr)
 
     pr_numbers_in_order: List[int] = []
-    for idx, branch_name in enumerate(ordered_branch_names):
-        base = base_default if idx == 0 else ordered_branch_names[idx - 1]
+    for idx, branch_name in enumerate(branches):
+        base = base_default if idx == 0 else branches[idx - 1]
         pr = head_to_pr.get(branch_name)
         if pr is None:
             title = branch_name
@@ -271,7 +228,7 @@ def sync_stack(
                 gh_update_pr(repo_path, pr.number, base=base, body=None)
                 print(f"PR updated: {pr.number}")
 
-    for idx, branch_name in enumerate(ordered_branch_names):
+    for idx, branch_name in enumerate(branches):
         pr = head_to_pr.get(branch_name)
         print(f"pr: {pr}")
         if not pr:
