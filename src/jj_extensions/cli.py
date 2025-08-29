@@ -17,6 +17,7 @@ from .sync import sync_stack
 )
 @click.pass_context
 def main(ctx: click.Context, repo: str) -> None:
+    print("main")
     ctx.ensure_object(dict)
     ctx.obj["repo"] = repo
 
@@ -46,6 +47,7 @@ def stack_sync(
     marker: str,
     dry_run: bool,
 ) -> None:
+    print("stack_sync")
     repo = ctx.obj["repo"]
     try:
         sync_stack(
@@ -64,4 +66,5 @@ def stack_sync(
 
 
 if __name__ == "__main__":
+    print("main")
     main()

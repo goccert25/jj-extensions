@@ -4,14 +4,10 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .shell import run, run_ok, capture_json
+from .shell import run, run_ok
 
 
-STACK_SECTION_TEMPLATE = (
-    "<!-- {key}:start -->\n"  # managed section start
-    "{lines}\n"
-    "<!-- {key}:end -->"
-)
+STACK_SECTION_TEMPLATE = "<!-- {key}:start -->\n{lines}\n<!-- {key}:end -->"
 
 
 @dataclass
@@ -29,8 +25,12 @@ class PullRequest:
 
 
 def get_default_branch(repo_path: str) -> str:
-    # Try gh first
     try:
+        # Use gh if available
+        from .shell import (
+            capture_json,
+        )  # local import to avoid unused when gh not present
+
         data = capture_json(
             ["gh", "repo", "view", "--json", "defaultBranchRef"], cwd=repo_path
         )
@@ -40,7 +40,6 @@ def get_default_branch(repo_path: str) -> str:
             return name
     except Exception:
         pass
-    # Fallback to git
     try:
         ref = run_ok(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], cwd=repo_path)
         return ref.rsplit("/", 1)[-1]
@@ -48,44 +47,66 @@ def get_default_branch(repo_path: str) -> str:
         return "main"
 
 
+def _sanitize_branch_name(raw: str) -> Optional[str]:
+    name = raw.strip()
+    if not name:
+        return None
+    # Ignore remote markers like "@origin/..."
+    if name.startswith("@"):
+        return None
+    # Drop trailing colon that jj sometimes shows after names
+    if name.endswith(":"):
+        name = name[:-1]
+    return name or None
+
+
 def list_branches(repo_path: str) -> List[BranchInfo]:
-    # Use jj branch list in JSON if available; otherwise parse text safely
+    # Prefer templated output for broad jj compatibility
     try:
-        data = capture_json(["jj", "branch", "list", "--json"], cwd=repo_path)
+        out = run_ok(
+            ["jj", "bookmark", "list", "-T", 'name++"\\n"'],
+            cwd=repo_path,
+        )
         branches: List[BranchInfo] = []
-        for item in data:
-            name = item.get("name") or item.get("names", [None])[0]
-            target = (item.get("local_target") or item.get("target") or {}).get("id")
-            if name and target:
-                branches.append(BranchInfo(name=name, target=target))
-        return branches
+        for line in out.splitlines():
+            name = _sanitize_branch_name(line)
+            if name:
+                branches.append(BranchInfo(name=name, target=""))
+        if branches:
+            return branches
     except Exception:
-        text = run_ok(["jj", "branch", "list"], cwd=repo_path)
-        branches: List[BranchInfo] = []
-        for line in text.splitlines():
-            parts = line.strip().split()
-            if not parts:
-                continue
-            name = parts[0]
-            # target hash often appears like @<shortid>; we can resolve later
+        pass
+    # Last resort: plain text parsing
+    text = run_ok(["jj", "bookmark", "list"], cwd=repo_path)
+    branches: List[BranchInfo] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.strip().split()
+        name_raw = parts[0]
+        name = _sanitize_branch_name(name_raw)
+        if name:
             branches.append(BranchInfo(name=name, target=""))
-        return branches
+    return branches
+
+
+def _quote_revset_string(s: str) -> str:
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def sort_branches_as_stack(repo_path: str, branches: List[BranchInfo]) -> List[str]:
-    # Derive a linear stack based on ancestry by jj order of revset: reachable from @ sorted by topological order
-    # Map branch to the youngest-first order using jj log over bookmarks
     names = [b.name for b in branches]
     if not names:
         return []
-    # Use revset of these bookmarks and order by topo so parents appear before children
     template = "{bookmarks|join(',')} {commit_id}\n"
-    revset = " or ".join([f"branch({name})" for name in names])
+    # Use bookmark() to select the commits pointed at by these bookmarks
+    rev_terms = [f"bookmark({_quote_revset_string(name)})" for name in names]
+    revset = " or ".join(rev_terms)
     out = run_ok(
         ["jj", "log", "-r", revset, "--no-graph", "-T", template], cwd=repo_path
     )
     lines = [l for l in out.splitlines() if l.strip()]
-    # Build map commit->branches listed on it
     commit_to_branches: List[Tuple[str, List[str]]] = []
     for line in lines:
         try:
@@ -94,7 +115,6 @@ def sort_branches_as_stack(repo_path: str, branches: List[BranchInfo]) -> List[s
             commit_to_branches.append((commit, bnames))
         except ValueError:
             continue
-    # Preserve topo order; for each commit, emit branches on it in listed order
     ordered: List[str] = []
     seen = set()
     for _, bnames in commit_to_branches:
@@ -102,7 +122,6 @@ def sort_branches_as_stack(repo_path: str, branches: List[BranchInfo]) -> List[s
             if b in names and b not in seen:
                 ordered.append(b)
                 seen.add(b)
-    # If any branches were missing (no direct commit line), append them
     for b in names:
         if b not in seen:
             ordered.append(b)
@@ -110,6 +129,8 @@ def sort_branches_as_stack(repo_path: str, branches: List[BranchInfo]) -> List[s
 
 
 def gh_list_open_prs_by_head(repo_path: str) -> Dict[str, PullRequest]:
+    from .shell import capture_json
+
     data = capture_json(
         [
             "gh",
@@ -149,7 +170,6 @@ def gh_create_pr(repo_path: str, head: str, base: str, title: str, body: str) ->
         ],
         cwd=repo_path,
     )
-    # gh prints URL; extract trailing number
     m = re.search(r"/(\d+)$", out.strip())
     if not m:
         raise RuntimeError(f"Failed to get PR number from gh output: {out}")
@@ -199,26 +219,24 @@ def sync_stack(
     marker_key: str = "jj-stack-sync",
     dry_run: bool = False,
 ) -> None:
-    # 1) Push; abort on failure
+    print("sync_stack")
     run(
         ["jj", "git", "push", "--allow-new", "--remote", remote],
         cwd=repo_path,
         check=True,
     )
 
-    # 2) Discover branches and ordering
     branches = list_branches(repo_path)
+    print(branches)
     if not branches:
         return
     ordered_branch_names = sort_branches_as_stack(repo_path, branches)
-
-    # Default base branch
+    print(ordered_branch_names)
     base_default = default_base or get_default_branch(repo_path)
-
-    # 3) Load existing PRs by head
+    print(base_default)
     head_to_pr = gh_list_open_prs_by_head(repo_path)
-
-    # 4) Ensure PRs exist and bases are correct; collect PR numbers in order
+    print(head_to_pr)
+    exit()
     pr_numbers_in_order: List[int] = []
     for idx, branch_name in enumerate(ordered_branch_names):
         base = base_default if idx == 0 else ordered_branch_names[idx - 1]
@@ -227,7 +245,6 @@ def sync_stack(
             title = branch_name
             body = ""
             if dry_run:
-                # Simulate PR number as 0 placeholder
                 pr_num = 0
             else:
                 pr_num = gh_create_pr(
@@ -240,11 +257,9 @@ def sync_stack(
                 )
         else:
             pr_numbers_in_order.append(pr.number)
-            # Update base if needed
             if pr.base != base and not dry_run:
                 gh_update_pr(repo_path, pr.number, base=base, body=None)
 
-    # 5) Update PR bodies with marker section list
     for idx, branch_name in enumerate(ordered_branch_names):
         pr = head_to_pr.get(branch_name)
         if not pr:
