@@ -51,6 +51,30 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && exec zsh
 
 To update after local changes, re-run `uv tool install .`.
 
+### Troubleshooting global install
+
+If reinstalling doesn’t reflect your latest source changes (uv can reuse a cached build):
+
+```bash
+uv tool uninstall jj-extensions   # uninstall by package name, not script name
+uv cache clean                    # clear uv’s cached build
+uv tool install .
+hash -r                           # refresh shell command cache
+```
+
+Confirm what’s being executed:
+
+```bash
+which -a jj-stack
+head -n3 "$(command -v jj-stack)"
+```
+
+During development, prefer running from local source (no reinstall needed):
+
+```bash
+uv run jj-stack stack sync --dry-run
+```
+
 ## Usage
 
 From a jj-enabled git repo:

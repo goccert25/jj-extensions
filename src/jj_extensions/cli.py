@@ -13,7 +13,7 @@ from .sync import sync_stack
     "--repo",
     type=click.Path(file_okay=False, dir_okay=True),
     default=".",
-    help="Path to repo (default: .)",
+    help="TEST Path to repo (default: .)",
 )
 @click.pass_context
 def main(ctx: click.Context, repo: str) -> None:

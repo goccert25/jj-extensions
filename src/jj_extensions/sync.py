@@ -96,13 +96,20 @@ def _quote_revset_string(s: str) -> str:
 
 
 def sort_branches_as_stack(repo_path: str, branches: List[BranchInfo]) -> List[str]:
-    names = [b.name for b in branches]
+    # Dedupe while preserving original order
+    seen = set()
+    names: List[str] = []
+    for b in branches:
+        if b.name not in seen:
+            names.append(b.name)
+            seen.add(b.name)
     if not names:
         return []
-    template = "{bookmarks|join(',')} {commit_id}\n"
-    # Use bookmark() to select the commits pointed at by these bookmarks
-    rev_terms = [f"bookmark({_quote_revset_string(name)})" for name in names]
-    revset = " or ".join(rev_terms)
+    # Template: bookmarks joined by comma, then space, then commit_id, newline
+    template = 'bookmarks.join(",") ++ " " ++ commit_id ++ "\\n"'
+    # Use bookmarks() to select the commits pointed at by these bookmarks
+    rev_terms = [f"bookmarks({_quote_revset_string(name)})" for name in names]
+    revset = " | ".join(rev_terms)
     out = run_ok(
         ["jj", "log", "-r", revset, "--no-graph", "-T", template], cwd=repo_path
     )
@@ -116,14 +123,14 @@ def sort_branches_as_stack(repo_path: str, branches: List[BranchInfo]) -> List[s
         except ValueError:
             continue
     ordered: List[str] = []
-    seen = set()
+    emitted = set()
     for _, bnames in commit_to_branches:
         for b in bnames:
-            if b in names and b not in seen:
+            if b in names and b not in emitted:
                 ordered.append(b)
-                seen.add(b)
+                emitted.add(b)
     for b in names:
-        if b not in seen:
+        if b not in emitted:
             ordered.append(b)
     return ordered
 
@@ -219,7 +226,6 @@ def sync_stack(
     marker_key: str = "jj-stack-sync",
     dry_run: bool = False,
 ) -> None:
-    print("sync_stack")
     run(
         ["jj", "git", "push", "--allow-new", "--remote", remote],
         cwd=repo_path,
@@ -227,7 +233,6 @@ def sync_stack(
     )
 
     branches = list_branches(repo_path)
-    print(branches)
     if not branches:
         return
     ordered_branch_names = sort_branches_as_stack(repo_path, branches)
@@ -236,7 +241,7 @@ def sync_stack(
     print(base_default)
     head_to_pr = gh_list_open_prs_by_head(repo_path)
     print(head_to_pr)
-    exit()
+
     pr_numbers_in_order: List[int] = []
     for idx, branch_name in enumerate(ordered_branch_names):
         base = base_default if idx == 0 else ordered_branch_names[idx - 1]
@@ -247,24 +252,34 @@ def sync_stack(
             if dry_run:
                 pr_num = 0
             else:
+                print(f"Creating PR for {branch_name} to {base}")
                 pr_num = gh_create_pr(
                     repo_path, head=branch_name, base=base, title=title, body=body
                 )
+                print(f"PR created: {pr_num}")
             pr_numbers_in_order.append(pr_num)
             if pr_num:
+                print(f"Adding PR to head_to_pr: {branch_name} -> {pr_num}")
                 head_to_pr[branch_name] = PullRequest(
                     number=pr_num, head=branch_name, base=base, body=""
                 )
         else:
+            print(f"Updating PR for {branch_name} to {base}")
             pr_numbers_in_order.append(pr.number)
             if pr.base != base and not dry_run:
+                print(f"Updating PR for {branch_name} to {base}")
                 gh_update_pr(repo_path, pr.number, base=base, body=None)
+                print(f"PR updated: {pr.number}")
 
     for idx, branch_name in enumerate(ordered_branch_names):
         pr = head_to_pr.get(branch_name)
+        print(f"pr: {pr}")
         if not pr:
             continue
         section = render_stack_section(marker_key, pr_numbers_in_order, idx)
+        print(f"section: {section}")
         new_body = upsert_marker_section(pr.body or "", marker_key, section)
+        print(f"new_body: {new_body}")
         if not dry_run:
+            print(f"Updating PR body for {branch_name}")
             gh_update_pr(repo_path, pr.number, base=None, body=new_body)
